@@ -7,50 +7,44 @@
 
 var	debug=1;
 
-var WebSocketServer=require("ws").Server; //https://github.com/websockets/ws
+var express = require('express');
+var path = require('path');
+var favicon = require('serve-favicon');
+var logger = require('morgan');
+var cookieParser = require('cookie-parser');
+var bodyParser = require('body-parser');
 
+var mustacheExpress = require('mustache-express');
+var crypto = require('crypto');
+
+var http = require('http'),
+	server = http.createServer(),
+	url = require('url'),
+	WebSocketServer = require('ws').Server,
+	websocket,
+	port = 8080;
 var os=require("os");
 var fs=require("fs");
 var zlib=require("zlib");
 var fileType=require("file-type");
-var req=require('request');
+var request=require('request');
 var jpeg=require('jpeg-js'); // jpeg-js library: https://github.com/eugeneware/jpeg-js
 var keypress = require('keypress');
 
-var db_url=fs.readFileSync("db_url.txt","utf8");
+var mongo = require('mongodb');
+var monk = require('monk');
+var db = monk('localhost:27017/brainbox');
 
-/*
-	Atlases[] is a sparse associative array, it can have undefined indices. Values are
-	eliminated from Atlases using 'delete'. Do not use '.length' to count the number of
-	elements in Atlases -- the array has to be first filtered (see the function
-	displayAtlases). In the code '.length' is only used to find an available slot with
-	higher index than any of those already present
-*/
+var db_url=fs.readFileSync(__dirname+"/public/js/db_url.txt","utf8");
 var	Atlases=[];
-
 var Brains=[];
-
-/*
-	Users[] is a sparse associative array. The comments for Atlases[] apply.
-*/
 var	Users=[];
-
-/*
-	usrsckts[] is a sparse associative array. The comments for Atlases[] apply.
-*/
 var	usrsckts=[];
-
-var	localdir=__dirname+"/../";
 var	uidcounter=1;
-
 var niiTag=bufferTag("nii",8);
 var mghTag=bufferTag("mgh",8);
 var jpgTag=bufferTag("jpg",8);
-
-var websocket;
-
 var enterCommands=0;
-
 var UndoStack=[];
 
 console.log("atlasMakerServer.js");
@@ -58,7 +52,366 @@ console.log(new Date());
 setInterval(function(){console.log(new Date())},60*60*1000); // time mark every 60 minutes
 console.log("free memory",os.freemem());
 
+// init web server
+var routes = require('./routes/index');
+var users = require('./routes/users');
+
+var app = express();
+app.engine('mustache', mustacheExpress());
+app.set('views', path.join(__dirname, 'views'));
+app.set('view engine', 'mustache');
+app.use(favicon(__dirname + '/public/favicon.png'));
+app.use(logger('dev'));
+app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: false }));
+app.use(cookieParser());
+app.use(express.static(path.join(__dirname, 'public')));
+
+/*
+app.use('/', routes);
+app.use('/users', users);
+*/
+
+//{-----passport
+var session = require('express-session');
+var passport = require('passport');
+var GithubStrategy = require('passport-github').Strategy;
+passport.use(new GithubStrategy(
+	JSON.parse(fs.readFileSync(__dirname+"/github-keys.json")),
+	function(accessToken,refreshToken,profile,done){return done(null, profile);}
+));
+app.use(session({secret: "a mi no me gusta la sémola"}));
+app.use(passport.initialize());
+app.use(passport.session());
+// add custom serialization/deserialization here (get user from mongo?) null is for errors
+passport.serializeUser(function(user, done) {done(null, user);});
+passport.deserializeUser(function(user, done) {done(null, user);});
+// Simple authentication middleware. Add to routes that need to be protected.
+function ensureAuthenticated(req, res, next) {
+  if (req.isAuthenticated()) {return next();}
+  else res.redirect('/');
+}
+app.get('/secure-route-example',ensureAuthenticated,function(req, res){res.send("access granted");});
+app.get('/logout', function(req, res){
+	console.log('logging out');
+	req.logout();
+	res.redirect('/');
+});
+app.get('/loggedIn', function(req, res){
+	if (req.isAuthenticated())
+		res.send({loggedIn:true,username:req.user.username});
+	else
+		res.send({loggedIn:false});
+});
+// start the GitHub Login process
+app.get('/auth/github',passport.authenticate('github'));
+app.get('/auth/github/callback',
+	passport.authenticate('github',{failureRedirect:'/'}),
+	function(req, res) {
+		// successfully loged in. Check if user is new
+		db.get('user').findOne({nickname:req.user.username},"-_id")
+		.then(function(json) {
+			if(!json) {
+				// insert new user
+				json={
+					name: req.user.displayName,
+					nickname: req.user.username,
+					url:req.user._json.blog,
+					brainboxURL:"http://brainbox.dev/user/"+req.user.username,
+					avatarURL:req.user._json.avatar_url,
+					joined: (new Date()).toJSON()
+				}
+				db.get('user').insert(json);
+			}
+		});
+		res.redirect('/');
+	});
+//-----}
+
+// GUI routes
+app.get('/', function(req,res) { // /auth/github
+	var login=	(req.isAuthenticated())?
+				("<a href='/user/"+req.user.username+"'>"+req.user.username+"</a> (<a href='/logout'>Log Out</a>)")
+				:("<a href='/auth/github'>Log in with GitHub</a>");
+	res.render('index', {
+		title: 'BrainBox',
+		login: login
+	});
+});
+
+app.get('/mri', function(req, res) {
+	var login=	(req.isAuthenticated())?
+				("<a href='/user/"+req.user.username+"'>"+req.user.username+"</a> (<a href='/logout'>Log Out</a>)")
+				:("<a href='/auth/github'>Log in with GitHub</a>");
+	var myurl = req.query.url;
+	var hash = crypto.createHash('md5').update(myurl).digest('hex');
+	
+	console.log("i'll query the db");
+	db.get('mri').find({url:"/data/"+hash+"/"}, {fields:{_id:0},sort:{$natural:-1},limit:1})
+	.then(function(json) {
+		json=json[0];
+		console.log("query finished");
+		if(json) {
+			console.log("a known mri file:",json);
+			res.render('mri', {
+				title: json.name||'Untitled MRI',
+				params: JSON.stringify(req.query),
+				mriInfo: JSON.stringify(json),
+				login: login
+			});
+		} else {
+			console.log("an unknown mri file");
+
+			console.log("check if its folder exists");
+			if (!fs.existsSync(__dirname+"/public/data/"+hash)) {
+				console.log("didn't exist: creating it");
+				fs.mkdirSync(__dirname+"/public/data/"+hash,0777);
+			}
+			
+			console.log("downloading the file");
+			var myurl = req.query.url;
+			var filename = url.parse(req.query.url).pathname.split("/").pop();
+			var file = fs.createWriteStream(__dirname+"/public/data/"+hash+"/"+filename,{mode:0777});
+			console.log(filename);
+			var requ  = http.get(myurl, function(response) {
+				response.pipe(file).on('close', function() {
+					console.log("file completely downloaded");
+					console.log("loading it");
+					getBrainAtPath(__dirname+"/public/data/"+hash+"/"+filename,function(mri) {
+						console.log("file loaded, get info");
+						// create json file for new dataset
+						var ip = req.headers['x-forwarded-for'] || 
+								 req.connection.remoteAddress || 
+								 req.socket.remoteAddress ||
+								 req.connection.socket.remoteAddress;
+						var username=(req.isAuthenticated())?req.user.username:ip
+						var json = {
+							localpath: __dirname+"/public/data/"+hash+"/"+filename,
+							filename: filename,
+							success: true,
+							source: myurl,
+							url: "/data/"+hash+"/",
+							included: (new Date()).toJSON(),
+							dim: mri.dim,
+							pixdim: mri.pixdim,
+							owner:username,
+							mri: {
+								brain: filename,
+								atlas: [{
+									owner:username,
+									created: (new Date()).toJSON(),
+									modified: (new Date()).toJSON(),
+									access: 'Read/Write',
+									type: 'volume',
+									filename: 'Atlas.nii.gz',
+									labels: 'http://brainbox.dev/labels/foreground.json'
+								}]
+							}
+						};
+						console.log("insert metadata in the database");
+						db.get('mri').insert(json);
+						res.render('mri', {
+							title: json.name||'Untitled MRI',
+							params: JSON.stringify(req.query),
+							mriInfo: JSON.stringify(json),
+							login: login
+						});
+					});
+				});
+			});			
+		}
+	}, function(err) {
+		console.error(err);
+	});
+});
+app.get('/user/:id', function(req, res) {
+	var login=	(req.isAuthenticated())?
+				("<a href='/user/"+req.user.username+"'>"+req.user.username+"</a> (<a href='/logout'>Log Out</a>)")
+				:("<a href='/auth/github'>Log in with GitHub</a>");
+	var username=req.params.id;
+	db.get('user').findOne({nickname:username},"-_id")
+	.then(function(json) {
+		// gather user information on mri, atlas and projects
+		var mri,atlas,projects;
+		db.get('mri').find({owner:username,backup:{$exists:false}})
+		.then(function(arr) {
+			mri=arr;
+			return db.get('mri').find({"mri.atlas":{$elemMatch:{owner:username}},backup:{$exists:false}});
+		})
+		.then(function(arr) {
+			atlas=arr;
+			return db.get('project').find({owner:username,backup:{$exists:false}});
+		})
+		.then(function(arr) {
+			projects=arr;
+			
+			var context={
+				title: req.params.id,
+				userInfo: JSON.stringify(json),
+				login: login,
+				atlasFiles:[]
+			}
+			context.MRIFiles=mri.map(function(o){return {
+				url:o.source,
+				name:o.name,
+				volDimensions:o.dim.join(" x ")
+			}});
+			atlas.map(function(o){
+				var i,arr=[];
+				for(i in o.mri.atlas) context.atlasFiles.push({
+					url:o.source,
+					parentName:o.name,
+					name:o.mri.atlas[i].name,
+					project:o.mri.atlas[i].project,
+					projectURL:'http://brainbox.dev/project/braincatalogue',
+					modified:o.mri.atlas[i].modified
+				});
+			});
+			context.projects=projects.map(function(o){return {
+				project:o.name,
+				projectURL:o.brainboxURL,
+				numFiles:o.files.length,
+				numCollaborators:o.collaborators.length,
+				owner:o.owner,
+				modified:o.modified
+			}});
+			context.username=json.name;
+			context.nickname=json.nickname;
+			context.joined=json.joined;
+			context.numMRI=context.MRIFiles.length;
+			context.numAtlas=context.atlasFiles.length;
+			context.numProjects=context.projects.length;
+			context.avatar="<img src='"+json.avatarURL+"'/>";
+			res.render('user',context);
+		});
+	});
+});
+app.get('/project/:id', function(req, res) {
+	var login=	(req.isAuthenticated())?
+				("<a href='/user/"+req.user.username+"'>"+req.user.username+"</a> (<a href='/logout'>Log Out</a>)")
+				:("<a href='/auth/github'>Log in with GitHub</a>");
+	db.get('project').findOne({shortname:req.params.id},"-_id")
+	.then(function(json) {
+		res.render('project', {
+			title: json.name,
+			projectInfo: JSON.stringify(json),
+			projectName: json.name,
+			login: login
+		});
+	});
+});
+
+// API routes
+app.get('/api/user/:name', function(req, res) {
+	db.get('user').findOne({nickname:req.params.name,backup:{$exists:false}},"-_id")
+	.then(function(json) {
+		if(json) {
+			if(req.query.var) {
+				var i,arr=req.query.var.split("/");
+				for(i in arr)
+					json=json[arr[i]];
+			}
+			res.send(json);
+		} else {
+			res.send();
+		}
+	});
+});
+app.get('/api/project/:name', function(req, res) {
+	db.get('project').findOne({shortname:req.params.name,backup:{$exists:false}},"-_id")
+	.then(function(json) {
+		if(json) {
+			if(req.query.var) {
+				var i,arr=req.query.var.split("/");
+				for(i in arr)
+					json=json[arr[i]];
+			}
+			res.send(json);
+		} else {
+			res.send();
+		}
+	})
+});
+app.get('/api/mri', function(req, res) {
+	var myurl=req.query.url;
+	var hash = crypto.createHash('md5').update(myurl).digest('hex');
+	// shell equivalent: db.mri.find({source:"http://braincatalogue.org/data/Pineal/P001/t1wdb.nii.gz"}).limit(1).sort({$natural:-1})
+	
+	db.get('mri').find({url:"/data/"+hash+"/",backup:{$exists:false}}, "-_id", {sort:{$natural:-1},limit:1})
+	.then(function(json) {
+		json=json[0];
+		if(json) {
+			if(req.query.var) {
+				var i,arr=req.query.var.split("/");
+				for(i in arr)
+					json=json[arr[i]];
+			}
+			res.send(json);
+		} else {
+			res.send();
+		}
+	}, function(err) {
+		console.error(err);
+	});
+});
+app.get('/api/getLabelsets', function(req, res) {
+	var i,arr=fs.readdirSync(__dirname+"/public/labels/"),info=[];
+	for(i in arr) {
+		var json=JSON.parse(fs.readFileSync(__dirname+"/public/labels/"+arr[i]));
+		info.push({
+			name:json.name,
+			source:"http://brainbox.dev/labels/"+arr[i]
+		});
+	}
+	res.send(info);
+});
+app.post('/api/log', function(req, res) {
+	var json=req.body;
+	json.ip=req.headers['x-forwarded-for'] || 
+			req.connection.remoteAddress || 
+			req.socket.remoteAddress ||
+			req.connection.socket.remoteAddress;
+	json.date=(new Date()).toJSON();
+	db.get('log').insert(json);
+	res.send();
+});
+
+// init web socket server
 initSocketConnection();
+server.on('request', app);
+server.listen(port, function () { console.log('Listening on ' + server.address().port,server.address()) });
+
+// catch 404 and forward to error handler
+app.use(function(req, res, next) {
+    var err = new Error('Not Found');
+    err.status = 404;
+    next(err);
+});
+
+// error handlers
+// development error handler
+// will print stacktrace
+if (app.get('env') === 'development') {
+    app.use(function(err, req, res, next) {
+        res.status(err.status || 500);
+        res.render('error', {
+            message: err.message,
+            error: err
+        });
+    });
+}
+// production error handler
+// no stacktraces leaked to user
+app.use(function(err, req, res, next) {
+    res.status(err.status || 500);
+    res.render('error', {
+        message: err.message,
+        error: {}
+    });
+});
+
+
+module.exports = app;
 
 
 function displayAtlases() {
@@ -231,7 +584,8 @@ function initSocketConnection() {
 	if(debug) console.log(new Date(),"[initSocketConnection] host:",host);
 	
 	try {
-		websocket = new WebSocketServer({port:8080});
+		websocket = new WebSocketServer({ server: server });
+		// websocket = new WebSocketServer({port:8080});
 		websocket.on("connection",function(s) {
 			console.log("[connection open]");
 			console.log("remote_address",s.upgradeReq.connection.remoteAddress);
@@ -397,7 +751,7 @@ function receiveRequestSliceMessage(data,user_socket) {
 	var view=user.view;		// user view
 	var slice=parseInt(user.slice);	// user slice
 	
-	var brain=getBrainAtPath(brainPath,function(data){
+	var brain=getBrainAtPath(__dirname+"/public"+brainPath,function(data){
 		sendSliceToUser(data,view,slice,user_socket);
 	});
 
@@ -408,20 +762,19 @@ function receiveRequestSliceMessage(data,user_socket) {
 function receiveSaveMetadataMessage(data,user_socket) {
 	if(debug>=1) console.log("[receiveSaveMetadataMessage]");
 
-	console.log("[receiveSaveMetadataMessage]");
-	console.log(JSON.stringify(data,null,"\t"));
-	
 	var uid=data.uid;		// user id
-	var	ms=+new Date;
-	var path1=localdir+Users[uid].dirname+"info.json";
-	var	path2=localdir+Users[uid].dirname+ms+"_info.json";
-	fs.rename(path1,path2,function(){
-		try {
-			fs.writeFileSync(path1,JSON.stringify(data.metadata,null,"\t"));
-		} catch(e) {
-			console.log("ERROR: Cannot save info.json file at "+dirname);
-		}
-	});
+	console.log("received save metadata message from user uid:",uid);
+	var json=data.metadata;
+	console.log("the metadata was json:",json);
+	json.modified=(new Date()).toJSON();
+	console.log("the modification date was:",json.modified);
+	json.modifiedBy=Users[uid].username||"unknown";
+	console.log("and the user that modified it:",json.modifiedBy);
+	console.log("going to insert this json object in the db");
+	// mark previous one as backup
+	db.get('mri').update({url:json.url,backup:{$exists:false}},{$set:{backup:true}},{multi:true});
+	// insert new one
+	db.get('mri').insert(json);
 }
 function receiveAtlasFromUserMessage(data,user_socket) {
 	if(debug>=1) console.log("[receiveAtlasFromUserMessage]");
@@ -734,7 +1087,7 @@ function loadAtlasNifti(atlas,username,callback)
 		
 	// Load nifty label
 	
-	var path=localdir+"/"+atlas.dirname+atlas.name;
+	var path=__dirname+"/public"+atlas.dirname+atlas.name;
 	var datatype=2;
 	var	vox_offset=352;
 	
@@ -845,8 +1198,8 @@ function saveNifti(atlas)
 		atlas.data.copy(nii,voxel_offset);
 		zlib.gzip(nii,function(err,niigz) {
 			var	ms=+new Date;
-			var path1=localdir+atlas.dirname+atlas.name;
-			var	path2=localdir+atlas.dirname+ms+"_"+atlas.name;
+			var path1=__dirname+"/public"+atlas.dirname+atlas.name;
+			var	path2=__dirname+"/public"+atlas.dirname+ms+"_"+atlas.name;
 			fs.rename(path1,path2,function(){
 				fs.writeFile(path1,niigz);
 			});
@@ -862,7 +1215,7 @@ function logToDatabase(key,value,username)
 	
 	if(!username)
 		username="Undefined";
-	req.post({
+	request.post({
   		url:db_url,
 		form:{
 			action:"add_log",
@@ -1229,7 +1582,6 @@ function loadBrainMGZ(data,callback) {
 function loadBrainCompressed(path,callback) {
 	if(debug)
 		console.log("[loadBrainCompressed]",path);
-	path="../"+path;
 	if(!fs.existsSync(path)) {
 		console.log("ERROR: File does not exist:",path);
 		return;

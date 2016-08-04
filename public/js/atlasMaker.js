@@ -68,7 +68,6 @@ var AtlasMakerWidget = {
 	info:{},	// information displayed over each brain slice
 	// undo stack
 	/* DEPRECATED Undo:[], */
-	dbphp:          "/php/brainbox.php",
 	version:	1, // version of the configuration file (slice number, plane, etc). Default=1
 
 	traceLog: function traceLog(f,l) {
@@ -840,8 +839,10 @@ var AtlasMakerWidget = {
 		var me=AtlasMakerWidget;
 		var l=me.traceLog(down,2);if(l)console.log(l);
 	
+		/*
 		if(MyLoginWidget.loggedin==0 || me.editMode==0)
 			return;
+		*/
 	
 		var z=me.User.slice;
 
@@ -880,8 +881,10 @@ var AtlasMakerWidget = {
 		var me=AtlasMakerWidget;
 		var l=me.traceLog(move,2);if(l)console.log(l);
 	
+		/*
 		if(MyLoginWidget.loggedin==0 || me.editMode==0)
 			return;
+		*/
 
 		var z=me.User.slice;
 
@@ -910,8 +913,10 @@ var AtlasMakerWidget = {
 		var me=AtlasMakerWidget;
 		var l=me.traceLog(up,2);if(l)console.log(l);
 
+		/*
 		if(MyLoginWidget.loggedin==0 || me.editMode==0)
 			return;
+		*/
 
 		// Send mouse up (touch ended) message
 		me.User.mouseIsDown = false;
@@ -1180,7 +1185,8 @@ var AtlasMakerWidget = {
 		var def=$.Deferred();
 	
 		// WS connection
-		var host = "ws://" + window.location.host + ":8080/";
+		//var host = "ws://" + window.location.host + ":8080/";
+		var host = "ws://localhost:8080/";
 	
 		if(me.debug)
 			console.log("[initSocketConnection] host:",host);
@@ -1497,16 +1503,14 @@ var AtlasMakerWidget = {
 	// Database
 	//==========
 	logToDatabase: function logToDatabase(key,value) {
+		var def=$.Deferred();
 		var me=AtlasMakerWidget;
 		var l=me.traceLog(logToDatabase,1);if(l)console.log(l);
-
-		var def=$.Deferred();
 		$.ajax({
-			url:AtlasMakerWidget.dbphp,
+			url:"/api/log",
 			type:"POST",
 			data: {
-				action:"add_log",
-				userName:MyLoginWidget.username,
+				username:me.User.username,
 				key:key,
 				value:value
 		}})
@@ -1527,6 +1531,15 @@ var AtlasMakerWidget = {
 		var me=AtlasMakerWidget;
 		var l=me.traceLog(initAtlasMaker);if(l)console.log(l);
 	
+		// check if user is loged in
+		$.get("/loggedIn",function(res) {
+			console.log(res);
+			if(res.loggedIn)
+				me.User.username=res.username
+			else
+				me.User.username='Anonymous';
+		});
+
 		// Create offscreen canvas for mri and atlas
 		me.brain_offcn=document.createElement('canvas');
 		me.brain_offtx=me.brain_offcn.getContext('2d');
@@ -1583,12 +1596,6 @@ var AtlasMakerWidget = {
 		var def=$.Deferred();
 		$.get("/templates/tools.html",function from_initAtlasMaker(html) {
 			me.container.append(html);
-			
-			// hide or show annotation tools depending on login changes
-			if(MyLoginWidget) {
-				me.loginChanged();
-				MyLoginWidget.subscribe(me.loginChanged);
-			}
 
 			// intercept keyboard events
 			$(document).keydown(function(e){me.keyDown(e)});
@@ -1692,28 +1699,6 @@ var AtlasMakerWidget = {
 			me.brain_pixdim=[1,1,1];
 
 		return def.resolve().promise();
-	},
-	loginChanged: function loginChanged() {
-		var me=AtlasMakerWidget;
-		var l=me.traceLog(loginChanged);if(l)console.log(l);
-
-		console.log("to",MyLoginWidget.loggedin);
-
-		if(MyLoginWidget.loggedin) {
-			$('body').addClass('loggedIn');
-			// Show all controls required to log in
-			//$(".loginRequired").css('display','inline-block');
-			me.User.username=MyLoginWidget.username;
-			// inform the server
-			me.sendUserDataMessage("logged in");
-		}
-		else {
-			$('body').removeClass('loggedIn');
-			// Hide all controls required to log in
-			//$(".loginRequired").css('display','none');
-			// inform the server
-			me.sendUserDataMessage("logged out");
-		}
 	},
 	slider: function slider(elem,callback) {
 		var me=AtlasMakerWidget;
